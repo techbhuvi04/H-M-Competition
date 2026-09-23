@@ -1,0 +1,30 @@
+# Data (download from Kaggle, see data/README.md)
+data/*
+!data/README.md
+*.csv
+*.parquet
+*.zip
+images/
+
+# Outputs
+outputs/*
+!outputs/.gitkeep
+*.pkl
+*.txt.model
+features_db*
+
+# Python / Jupyter
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+.env
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+
+# Kaggle credentials
+kaggle.json

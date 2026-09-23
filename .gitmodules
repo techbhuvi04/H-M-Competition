@@ -1,0 +1,3 @@
+[submodule "handmhelpers"]
+	path = handmhelpers
+	url = https://github.com/JacobCP/kaggle-handm-helpers

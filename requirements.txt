@@ -1,6 +1,6 @@
 pandas>=1.5
 numpy>=1.23
-scikit-learn>=1.1
+pyarrow>=10
 lightgbm>=4.0
 jupyter
 nbformat

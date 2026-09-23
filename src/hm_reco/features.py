@@ -1,145 +1,204 @@
-"""Feature engineering and training-frame assembly.
+"""Feature engineering for (customer, article) candidate pairs.
 
-The core idea (standard for this kind of competition): pick a "target week"
-whose purchases are the labels, build candidates + features from *only*
-the weeks strictly before it, then label each candidate 1 if the customer
-actually bought that article in the target week, else 0.
+Almost all features are user-item *interaction* features, which is where
+the signal is in this competition. Following the categories that worked
+best in practice:
 
-Stacking several (feature window, target week) pairs gives the ranker more
-training data without needing extra raw history.
+  Count          user-item / user-category / item counts over the last week,
+                 month (4w), season (12w), same week last year and all time,
+                 plus a time-weighted count
+  Time           days since first / last purchase
+  Mean/Max/Min   aggregations of price, age and sales channel
+  Difference /   customer age vs. the item's average buyer age, customer
+  Ratio          spend vs. item price, share of a user's purchases in a category
+  Retrieval      the scores each retrieval strategy produced (itemCF
+                 similarity, popularity rank, repurchase recency, ...)
+
+About half of all customers have no purchases in the last 3 months, so the
+all-time cumulative features matter as much as the recent-window ones.
+
+All features for target week W are computed from `hist` (weeks < W) only.
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from . import candidates as cand_mod
+from .data import ARTICLE_CATEGORICALS
+
+KEYS = ["customer_id", "article_id"]
+WINDOWS = {"1w": 7, "4w": 28, "12w": 84}
 
 
-def article_popularity_features(transactions: pd.DataFrame, target_week: int, windows=(1, 2, 4)) -> pd.DataFrame:
-    """Purchase counts per article over the last N weeks before target_week,
-    for each window in `windows`. Captures short-term trend.
-    """
-    out = None
-    for w in windows:
-        recent = transactions[transactions["week"] >= target_week - w]
-        counts = recent.groupby("article_id").size().rename(f"article_count_last_{w}w")
-        out = counts.to_frame() if out is None else out.join(counts, how="outer")
-    return out.fillna(0).reset_index()
-
-
-def article_price_features(transactions: pd.DataFrame, target_week: int, window: int = 4) -> pd.DataFrame:
-    """Average and most-recent price per article, from the last `window`
-    weeks. Price signals markdowns/promotions, which drive short-term demand.
-    """
-    recent = transactions[transactions["week"] >= target_week - window]
-    agg = recent.groupby("article_id")["price"].agg(article_avg_price="mean")
-    last_price = (
-        recent.sort_values("t_dat").groupby("article_id")["price"].last().rename("article_last_price")
-    )
-    return agg.join(last_price, how="outer").reset_index()
-
-
-def customer_features(transactions: pd.DataFrame, customers: pd.DataFrame, target_week: int, window: int = 12) -> pd.DataFrame:
-    """Per-customer summary of recent activity: purchase count, average
-    spend, and days since last purchase (as of the start of target_week).
-    """
-    recent = transactions[transactions["week"] >= target_week - window]
-    agg = recent.groupby("customer_id").agg(
-        cust_purchase_count=("article_id", "size"),
-        cust_avg_price=("price", "mean"),
-        cust_last_week=("week", "max"),
-    )
-    agg["cust_weeks_since_purchase"] = target_week - agg["cust_last_week"] - 1
-    agg = agg.drop(columns="cust_last_week").reset_index()
-
-    out = customers[["customer_id", "age"]].merge(agg, on="customer_id", how="left")
-    out["cust_purchase_count"] = out["cust_purchase_count"].fillna(0)
-    out["cust_weeks_since_purchase"] = out["cust_weeks_since_purchase"].fillna(window)
+def _window_flags(hist: pd.DataFrame, end_day: int) -> pd.DataFrame:
+    """Add 0/1 columns marking which recency windows each transaction falls in,
+    plus a time-decay weight, so windowed counts are one groupby-sum."""
+    rel = (hist["day"] - end_day).astype("int16")
+    out = hist.assign(rel=rel)
+    for name, days in WINDOWS.items():
+        out[f"in_{name}"] = (rel < days).astype("int8")
+    out["tw"] = (1.0 / (1.0 + rel / 7.0)).astype("float32")
     return out
 
 
-def customer_article_features(transactions: pd.DataFrame, target_week: int) -> pd.DataFrame:
-    """Per (customer, article) history: how many times bought before, and
-    how many weeks ago the most recent purchase was. The strongest features
-    for the repurchase signal.
-    """
-    hist = transactions[["customer_id", "article_id", "week"]]
-    agg = hist.groupby(["customer_id", "article_id"]).agg(
-        ca_bought_count=("week", "size"),
-        ca_last_week=("week", "max"),
-    )
-    agg["ca_weeks_since_bought"] = target_week - agg["ca_last_week"] - 1
-    return agg.drop(columns="ca_last_week").reset_index()
+def _f32(frame: pd.DataFrame) -> pd.DataFrame:
+    for c in frame.columns:
+        if frame[c].dtype == "float64":
+            frame[c] = frame[c].astype("float32")
+    return frame
 
 
-def attach_article_metadata(cand: pd.DataFrame, articles: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    """Join selected static article columns (category, department, ...)."""
-    return cand.merge(articles[["article_id"] + columns], on="article_id", how="left")
+def item_features(hist: pd.DataFrame, customers: pd.DataFrame, articles: pd.DataFrame, end_day: int) -> pd.DataFrame:
+    h = _window_flags(hist, end_day)
+    g = h.groupby("article_id")
+    f = pd.DataFrame({
+        "i_cnt_all": g.size(),
+        "i_cnt_1w": g["in_1w"].sum(),
+        "i_cnt_4w": g["in_4w"].sum(),
+        "i_cnt_12w": g["in_12w"].sum(),
+        "i_tw_cnt": g["tw"].sum(),
+        "i_first_days": g["rel"].max(),
+        "i_last_days": g["rel"].min(),
+        "i_price_mean": g["price"].mean(),
+        "i_price_max": g["price"].max(),
+        "i_price_min": g["price"].min(),
+        "i_channel_mean": g["sales_channel_id"].mean(),
+    })
+    # same week last year: seasonality signal
+    ly = h[(h["rel"] >= 52 * 7 - 7) & (h["rel"] < 52 * 7)]
+    f["i_cnt_ly"] = ly.groupby("article_id").size()
+
+    recent = h[h["in_4w"] == 1]
+    rg = recent.groupby("article_id")
+    f["i_users_4w"] = rg["customer_id"].nunique()
+    f["i_price_4w"] = rg["price"].mean()
+    ages = customers.set_index("customer_id")["age"]
+    recent_age = recent["customer_id"].map(ages)
+    f["i_age_mean_4w"] = recent_age.groupby(recent["article_id"]).mean()
+    f["i_age_std_4w"] = recent_age.groupby(recent["article_id"]).std()
+
+    last_week = h[h["in_1w"] == 1]
+    f["i_price_1w"] = last_week.groupby("article_id")["price"].mean()
+
+    f["i_trend"] = f["i_cnt_1w"] / (f["i_cnt_4w"] / 4 + 1)
+    f["i_price_drop"] = f["i_price_1w"] / f["i_price_4w"]
+    f[["i_cnt_ly", "i_users_4w"]] = f[["i_cnt_ly", "i_users_4w"]].fillna(0)
+
+    f = f.reset_index()
+    pc = articles.set_index("article_id")["product_code"]
+    f["product_code"] = f["article_id"].map(pc)
+    pg = f.groupby("product_code")
+    f["pc_cnt_1w"] = pg["i_cnt_1w"].transform("sum")
+    f["pc_cnt_4w"] = pg["i_cnt_4w"].transform("sum")
+    return _f32(f.drop(columns="product_code"))
 
 
-def build_training_frame(
-    transactions: pd.DataFrame,
+def user_features(hist_c: pd.DataFrame, customers: pd.DataFrame, end_day: int) -> pd.DataFrame:
+    h = _window_flags(hist_c, end_day)
+    g = h.groupby("customer_id")
+    f = pd.DataFrame({
+        "u_cnt_all": g.size(),
+        "u_cnt_1w": g["in_1w"].sum(),
+        "u_cnt_4w": g["in_4w"].sum(),
+        "u_cnt_12w": g["in_12w"].sum(),
+        "u_first_days": g["rel"].max(),
+        "u_last_days": g["rel"].min(),
+        "u_active_days": g["day"].nunique(),
+        "u_price_mean": g["price"].mean(),
+        "u_price_max": g["price"].max(),
+        "u_price_min": g["price"].min(),
+        "u_channel_mean": g["sales_channel_id"].mean(),
+        "u_n_items": g["article_id"].nunique(),
+    }).reset_index()
+    cols = ["customer_id", "age", "FN", "Active", "club_member_status", "fashion_news_frequency"]
+    out = customers[cols].merge(f, on="customer_id", how="left")
+    for c in ["u_cnt_all", "u_cnt_1w", "u_cnt_4w", "u_cnt_12w", "u_active_days", "u_n_items"]:
+        out[c] = out[c].fillna(0)
+    return _f32(out)
+
+
+def user_item_features(hist_c: pd.DataFrame, end_day: int) -> pd.DataFrame:
+    h = _window_flags(hist_c, end_day)
+    g = h.groupby(KEYS)
+    f = pd.DataFrame({
+        "ui_cnt_all": g.size(),
+        "ui_cnt_1w": g["in_1w"].sum(),
+        "ui_cnt_4w": g["in_4w"].sum(),
+        "ui_cnt_12w": g["in_12w"].sum(),
+        "ui_tw_cnt": g["tw"].sum(),
+        "ui_first_days": g["rel"].max(),
+        "ui_last_days": g["rel"].min(),
+    }).reset_index()
+    return _f32(f)
+
+
+def user_group_features(hist_c: pd.DataFrame, articles: pd.DataFrame, end_day: int, col: str, prefix: str) -> pd.DataFrame:
+    """Counts of the customer's purchases within one article grouping
+    (product_code / product_type / department / ...)."""
+    h = _window_flags(hist_c, end_day)
+    h[col] = h["article_id"].map(articles.set_index("article_id")[col])
+    g = h.groupby(["customer_id", col])
+    f = pd.DataFrame({
+        f"{prefix}_cnt_all": g.size(),
+        f"{prefix}_cnt_4w": g["in_4w"].sum(),
+        f"{prefix}_tw_cnt": g["tw"].sum(),
+        f"{prefix}_last_days": g["rel"].min(),
+    }).reset_index()
+    return _f32(f)
+
+
+GROUP_FEATURES = {
+    "product_code": "upc",
+    "product_type_no": "upt",
+    "department_no": "udp",
+    "section_no": "usc",
+    "garment_group_no": "ugg",
+}
+
+
+def build(
+    cand: pd.DataFrame,
+    hist: pd.DataFrame,
     customers: pd.DataFrame,
     articles: pd.DataFrame,
-    target_week: int,
-    *,
-    history_weeks: int,
-    repurchase_weeks: int = 3,
-    pair_weeks: int = 2,
-    pair_top_k: int = 5,
-    age_bucket_weeks: int = 1,
-    article_columns: tuple[str, ...] = ("index_code", "product_group_name", "department_no"),
-    for_customers: pd.Series | None = None,
-    labeled: bool = True,
-):
-    """Assemble one (candidates + features [+ label]) frame for `target_week`.
+    end_day: int,
+    item_feats: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Attach every feature to the candidate pairs in `cand`. `item_feats`
+    (from `item_features`) can be passed in to avoid recomputing it per batch."""
+    cust_ids = cand["customer_id"].unique()
+    hist_c = hist[hist["customer_id"].isin(cust_ids)]
 
-    `history` is transactions restricted to weeks strictly before
-    `target_week` and no further back than `history_weeks` — this is the
-    only data the candidate/feature functions may see, which is what keeps
-    the split leakage-free.
+    df = cand.merge(articles, on="article_id", how="left")
+    if item_feats is None:
+        item_feats = item_features(hist, customers, articles, end_day)
+    df = df.merge(item_feats, on="article_id", how="left")
+    df = df.merge(user_features(hist_c, customers[customers["customer_id"].isin(cust_ids)], end_day),
+                  on="customer_id", how="left")
+    df = df.merge(user_item_features(hist_c, end_day), on=KEYS, how="left")
+    for col, prefix in GROUP_FEATURES.items():
+        df = df.merge(user_group_features(hist_c, articles, end_day, col, prefix),
+                      on=["customer_id", col], how="left")
 
-    If `labeled` is True (training/validation), a `label` column is added:
-    1 if the customer actually bought that article during `target_week`.
-    If False (final submission), no label column is added and
-    `for_customers` should list every customer_id we must predict for.
-    """
-    history = transactions[
-        (transactions["week"] < target_week) & (transactions["week"] >= target_week - history_weeks)
-    ]
+    count_cols = [c for c in df.columns if "_cnt" in c and c.startswith(("ui_", "up", "ud", "us", "ug"))]
+    df[count_cols] = df[count_cols].fillna(0)
 
-    pairs = cand_mod.build_item_pairs(
-        history[history["week"] >= target_week - pair_weeks], top_k=pair_top_k
-    )
+    # difference / ratio features
+    df["age_diff"] = df["age"] - df["i_age_mean_4w"]
+    df["age_z"] = df["age_diff"] / (df["i_age_std_4w"] + 1)
+    df["price_ratio"] = df["i_price_1w"].fillna(df["i_price_mean"]) / df["u_price_mean"]
+    df["ui_share_of_item"] = df["ui_cnt_all"] / (df["i_cnt_all"] + 1)
+    df["ui_share_of_user"] = df["ui_cnt_all"] / (df["u_cnt_all"] + 1)
+    for prefix in GROUP_FEATURES.values():
+        df[f"{prefix}_share"] = df[f"{prefix}_cnt_all"] / (df["u_cnt_all"] + 1)
+    df["n_sources"] = df[["rep_days_ago", "cf_score", "sib_sales", "pop_rank", "agepop_rank"]].notna().sum(axis=1)
 
-    customer_pool = for_customers if for_customers is not None else customers["customer_id"]
+    return _f32(df)
 
-    repurchase = cand_mod.repurchase_candidates(history, repurchase_weeks, target_week)
-    pair_cand = cand_mod.item_pair_candidates(history, pairs, pair_weeks, target_week)
-    popular = cand_mod.popular_last_week_candidates(history, target_week)
-    age_popular = cand_mod.popular_by_age_bucket(history, customers, target_week, age_bucket_weeks)
 
-    cand = cand_mod.combine_candidates(
-        repurchase, pair_cand, age_popular, popular, all_customers=customer_pool
-    )
-    # Restrict to the customers we actually need predictions/labels for.
-    cand = cand[cand["customer_id"].isin(customer_pool)]
+FEATURE_EXCLUDE = {"customer_id", "article_id", "label", "product_code"}
+CATEGORICAL = [c for c in ARTICLE_CATEGORICALS] + ["club_member_status", "fashion_news_frequency"]
 
-    if labeled:
-        target = transactions[transactions["week"] == target_week][["customer_id", "article_id"]].drop_duplicates()
-        target["label"] = 1
-        cand = cand.merge(target, on=["customer_id", "article_id"], how="left")
-        cand["label"] = cand["label"].fillna(0).astype("int8")
 
-    cand = cand.merge(article_popularity_features(history, target_week), on="article_id", how="left")
-    cand = cand.merge(article_price_features(history, target_week), on="article_id", how="left")
-    cand = cand.merge(customer_features(history, customers, target_week), on="customer_id", how="left")
-    cand = cand.merge(customer_article_features(history, target_week), on=["customer_id", "article_id"], how="left")
-    cand = attach_article_metadata(cand, articles, list(article_columns))
-
-    numeric_fill_cols = [c for c in cand.columns if c.startswith(("article_count", "article_avg", "article_last", "ca_"))]
-    cand[numeric_fill_cols] = cand[numeric_fill_cols].fillna(0)
-    cand["ca_weeks_since_bought"] = cand["ca_weeks_since_bought"].replace(0, history_weeks)
-
-    return cand
+def feature_columns(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if c not in FEATURE_EXCLUDE]

@@ -1,108 +1,125 @@
 # H&M Personalized Fashion Recommendations
 
-A two-stage recommender system (candidate retrieval → LightGBM LambdaRank ranking) for the
-[H&M Personalized Fashion Recommendations](https://www.kaggle.com/competitions/h-and-m-personalized-fashion-recommendations)
-Kaggle competition. The task: for every customer, predict the 12 articles they are most likely
-to buy in the 7 days after the training data ends.
+A recommender for the [H&M Personalized Fashion Recommendations](https://www.kaggle.com/competitions/h-and-m-personalized-fashion-recommendations)
+Kaggle competition. For each of 1.37M customers it predicts the 12 articles they are most likely to buy in the
+week after the training data ends.
 
-Built with plain **pandas, NumPy, scikit-learn and LightGBM** — no GPU or external helper library required.
+The pipeline has three stages: **multi-strategy retrieval**, then **user-item interaction features**, then a
+**LightGBM binary classifier**. It is written in pandas and LightGBM and runs on a laptop with 8 GB of RAM and no GPU.
 
-## Problem
+## Results
 
-- **Data:** ~31.8M transactions (2018-09-20 to 2020-09-22), ~1.37M customers, ~105K articles with metadata.
-- **Goal:** for every customer, output a ranked list of 12 `article_id`s for the following week.
-- **Metric:** Mean Average Precision @ 12 (MAP@12). Ranking order matters, and only customers who
-  actually purchase in the test week are scored — but there's no penalty for guessing wrong, so
-  every customer should get a full 12 predictions.
+Validation uses the last week of the data (2020-09-16 to 09-22), the week right before the test week. Every customer
+who bought something that week (68,984 customers) is scored.
+
+| Model | Validation MAP@12 |
+|---|---|
+| Top-12 popular items of the previous week | 0.00959 |
+| **Retrieval + LightGBM (this repo)** | **0.03626** |
+
+| Candidate stage (validation week) | Value |
+|---|---|
+| Candidates per customer | ~104 |
+| Purchases retrieved | 29,114 of 213,728 (13.6%) |
+
+Retrieval recall sets the upper limit: the ranker can only reorder what retrieval found.
 
 ## Approach
 
 ```
-transactions ──► candidate generation ──► feature engineering ──► LightGBM LambdaRank ──► top-12 per customer
+transactions ──► retrieval (~100 candidates / customer) ──► ~90 features ──► LightGBM ──► top 12
 ```
 
-### 1. Candidate generation (recall) — [`src/hm_reco/candidates.py`](src/hm_reco/candidates.py)
-For each customer, candidates are the union of:
+The approach follows the ideas in the
+[1st place write-up](https://www.kaggle.com/competitions/h-and-m-personalized-fashion-recommendations/writeups/senkin13-30crmnsia-1st-place-solution)
+(senkin13 and 30CrMnSiA): build the training data yourself from past weeks, use several recall strategies
+biased towards recent popularity, compute mostly interaction features, downsample negatives, and train a GBDT.
+It is scaled down to fit in 8 GB of RAM.
 
-| Source | Idea |
+### 1. Retrieval: [`src/hm_reco/retrieval.py`](src/hm_reco/retrieval.py)
+
+| Strategy | Candidates / customer | Idea |
+|---|---|---|
+| Repurchase | up to 30 | Items the customer bought in the last 2 years, most recent first |
+| ItemCF | up to 20 | Items co-purchased with the customer's recent purchases (cosine-normalised, recency-weighted) |
+| Siblings | ~5 | Best-selling colour and size variants (same `product_code`) of recent purchases |
+| Popular | 50 | Time-weighted best sellers of the previous week |
+| Age popular | 50 | Best sellers of the previous week within the customer's age bucket |
+
+Fashion is fast-moving and seasonal, so recent popularity is the strongest single source. On the validation week,
+the top 100 popular items alone recover more purchases than all the personalised sources combined. Each
+strategy's score (repurchase recency, itemCF score, popularity rank, ...) is kept as a feature.
+
+### 2. Features: [`src/hm_reco/features.py`](src/hm_reco/features.py)
+
+| Type | Examples |
 |---|---|
-| Repurchase | Items the customer bought in the last 3 weeks |
-| Item pairs | Items frequently co-purchased (same customer, same day) with the customer's recent items |
-| Popular last week | Global best-sellers from the week before the target week (cold-start fallback) |
-| Age-bucket popularity | Best-sellers within the customer's age quartile |
+| Count | user-item, user-product-code, user-department/section/product-type/garment-group and item counts over the last week, 4 weeks, 12 weeks, the same week last year and all time; time-weighted counts |
+| Time | days since first and last purchase (user, item, user-item, user-category) |
+| Mean / max / min | price, buyer age, sales channel |
+| Difference / ratio | customer age minus the item's average buyer age, item price vs. customer's average spend, user-item count as a share of the user's and the item's totals, category shares |
+| Retrieval | itemCF score, popularity ranks, repurchase recency, number of sources that retrieved the item |
 
-### 2. Features — [`src/hm_reco/features.py`](src/hm_reco/features.py)
-- **Article:** purchase counts over 1/2/4-week windows (trend), average and most-recent price
-- **Customer:** recent purchase count, average spend, weeks since last purchase, age
-- **Customer × article:** times bought before, weeks since last bought (the strongest repurchase signal)
-- **Article metadata:** category/department/product-group joined from `articles.csv`
+About half of all customers have no purchases in the last 3 months, so all-time cumulative features are included
+alongside the recent windows. Every feature for target week *W* is computed only from weeks before *W*.
 
-All features for a given target week are computed strictly from transactions *before* that week —
-no leakage from the label week.
+Features with the most gain: time-weighted count of the customer's purchases of the same product (`upc_tw_cnt`),
+item sales last week (`i_cnt_1w`), department, and days since the customer last bought the item (`ui_last_days`).
 
-### 3. Ranking — [`src/hm_reco/model.py`](src/hm_reco/model.py)
-- `LGBMRanker` with the LambdaRank objective (directly optimizes ranking quality, closer to MAP@12
-  than plain binary classification).
-- **Validation:** a time-based split — the last available week is held out, and the model is trained
-  on the week before it. Random splits would leak future information.
-- **Submission:** the final model retrains on the most recent labeled week and predicts one week ahead;
-  customers with fewer than 12 candidates are padded with the fallback popular-items list
-  ([`src/hm_reco/submission.py`](src/hm_reco/submission.py)).
+### 3. Training: [`src/hm_reco/pipeline.py`](src/hm_reco/pipeline.py)
 
-### Evaluation — [`src/hm_reco/evaluation.py`](src/hm_reco/evaluation.py)
-A from-scratch MAP@12 implementation matching the competition's own scoring rule (customers with no
-purchases in the scored week are excluded, predictions are deduplicated and capped at 12).
+- **Training data:** 6 consecutive target weeks. For each week, candidates are retrieved for that week's buyers
+  and labelled 1 if bought.
+- **Negative downsampling:** 600k negatives are kept per week, before features are built. This keeps memory
+  manageable (about 3.8M training rows).
+- **Model:** LightGBM binary classifier (127 leaves, learning rate 0.05), with early stopping on the validation week.
+- **Submission:** the target weeks are shifted forward one week and the model is retrained for the best iteration
+  found in validation. All customers are then scored in batches. Any customer with fewer than 12 candidates is
+  padded with popular items.
 
 ## Repository structure
 
 ```
 .
-├── hm-recommendations.ipynb   # end-to-end driver notebook: load → split → candidates → features → train → validate → predict
+├── train.py                  # command line: `cv` (validate) and `submit` (write submission.csv)
+├── hm-recommendations.ipynb  # step-by-step walkthrough of the same pipeline
 ├── src/hm_reco/
-│   ├── data.py          # CSV loading, dtype downcasting, week indexing
-│   ├── candidates.py    # candidate generation (recall)
-│   ├── features.py      # feature engineering + training-frame assembly
-│   ├── model.py          # LGBMRanker training / scoring
-│   ├── evaluation.py    # MAP@12 implementation
-│   └── submission.py    # zero-padded, fallback-filled submission.csv writer
-├── data/                 # Kaggle CSVs go here (git-ignored, see data/README.md)
-│   ├── articles.csv
-│   ├── customers.csv
-│   ├── transactions_train.csv
-│   ├── sample_submission.csv
-│   └── README.md
-├── outputs/              # submission.csv lands here (git-ignored)
+│   ├── data.py         # CSV loading, parquet cache, compact ids, week indexing
+│   ├── retrieval.py    # candidate generation strategies
+│   ├── features.py     # interaction feature engineering
+│   ├── pipeline.py     # training set assembly, negative sampling, training, batched scoring
+│   ├── evaluation.py   # MAP@12
+│   └── submission.py   # submission.csv writer (zero-padded article ids)
+├── data/               # Kaggle CSVs go here (git-ignored, see data/README.md)
+├── outputs/            # logs, saved model, submission.csv (git-ignored)
 ├── requirements.txt
 └── README.md
 ```
 
-## Getting started
+## Running it
 
 ```bash
-git clone <this-repo-url>
-cd <repo>
-
-python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+# put the competition CSVs in data/ (see data/README.md)
 
-# Download the data into data/ (see data/README.md)
-kaggle competitions download -c h-and-m-personalized-fashion-recommendations -p data
-unzip data/h-and-m-personalized-fashion-recommendations.zip -d data
-
-jupyter notebook hm-recommendations.ipynb
+python train.py cv --weeks 6 --neg 600000                  # ~15 min, prints validation MAP@12 and best iteration
+python train.py submit --weeks 6 --neg 600000 --rounds 434 # ~2 h, writes outputs/submission.csv
+python train.py cv --weeks 1 --neg 200000 --sample 5000    # ~3 min smoke test
 ```
 
-Runs on a normal laptop (no GPU needed) — full data load is ~31.8M transaction rows and takes about
-a minute; candidate/feature generation on the full customer base takes a few minutes per week.
-The submission is written to `outputs/submission.csv`.
+The first run parses the CSVs (about 1 minute) and caches them as parquet in `data/`. Timings are from an
+8-core laptop with 8 GB of RAM.
 
 ## Possible improvements
-- More retrieval sources: item2vec/ALS embeddings, same-`product_code` colour/size siblings, text or
-  image similarity from the product descriptions and garment photos.
-- Cross-validate over multiple recent weeks instead of a single holdout, for a more stable score estimate.
-- Blend with a second ranker (CatBoost/XGBoost) or tune LightGBM hyperparameters.
 
-## License
+- **Recall.** 13.6% of purchases are retrieved at about 100 candidates per customer. The 1st-place team retrieved
+  roughly 18% at the same budget. Embedding-based retrieval (word2vec item embeddings, graph user embeddings) and
+  more tuning of the source mix are the most direct next steps.
+- **More data.** 1–2M negatives per week instead of 600k, and more training weeks, given more memory.
+- **Ensembling.** Blend several LightGBM seeds with CatBoost.
+
+## Data
+
 The competition data belongs to H&M Group and is covered by the
-[competition rules](https://www.kaggle.com/competitions/h-and-m-personalized-fashion-recommendations/rules);
-it is not redistributed here.
+[competition rules](https://www.kaggle.com/competitions/h-and-m-personalized-fashion-recommendations/rules).
+It is not included in this repository.
